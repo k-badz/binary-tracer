@@ -7,8 +7,10 @@
 #include "profiler.h"
 
 enum PATCH_MODE {
-    PATCH_MODE_PATTERN_RELATIVE_CALLSITE,
-    PATCH_MODE_PATTERN_ENTRY,
+    PATCH_MODE_PATTERN_CALLER,
+    PATCH_MODE_PATTERN_CALLEE_ENTRY,
+    PATCH_MODE_PATTERN_BEGIN,
+    PATCH_MODE_PATTERN_END,
     PATCH_MODE_SYMBOL_ENTRY, // not implemented
     NUM_PATCH_MODES
 };
@@ -32,9 +34,10 @@ extern "C" uint64_t ret_stack_pop(void* tls);
 std::string get_tracer_commandfile();
 void tracer_init(std::string command_file);
 char* get_allocation_near_preferred(void* preferred_address, uint64_t size);
-int trace_relative_call(const char* found_pattern_ptr, uint32_t pattern_call_instruction_offset, const char* event_name);
-int trace_entry(const char* found_pattern_ptr, uint32_t pattern_call_instruction_offset, const char* event_name);
-int trace_patterns(const char* pattern_to_find, uint64_t pattern_length, uint32_t pattern_aux_offset, const char* event_name, PATCH_MODE mode);
+int trace_caller(const char* found_pattern_ptr, uint32_t pattern_call_instruction_offset, const char* event_name);
+int trace_callee(const char* found_pattern_ptr, uint32_t prolog_copy_size, const char* event_name);
+int trace_begin_end(const char* found_pattern_ptr, uint32_t pattern_call_offset, uint32_t prolog_copy_size, const char* event_name, bool is_begin);
+int trace_patterns(const char* pattern_to_find, uint64_t pattern_length, uint32_t pattern_aux_offset1, uint32_t pattern_aux_offset2, const char* event_name, PATCH_MODE mode);
 int trace_symbols(const char* symbol_to_find, uint64_t pattern_length, uint32_t pattern_aux_offset, const char* event_name);
 
 // Export functions to allow external control of the profiler
@@ -133,7 +136,7 @@ char* get_allocation_near_preferred(void* preferred_address, uint64_t size)
     return new_trampoline;
 }
 
-int trace_relative_call(const char* found_pattern_ptr, uint32_t pattern_call_instruction_offset, const char* event_name)
+int trace_caller(const char* found_pattern_ptr, uint32_t pattern_call_instruction_offset, const char* event_name)
 {
     static char trampoline_string[] =
         "\x50"                                      // push        rax  
@@ -211,7 +214,7 @@ int trace_relative_call(const char* found_pattern_ptr, uint32_t pattern_call_ins
     return 0;
 }
 
-int trace_entry(const char* found_pattern_ptr, uint32_t prolog_copy_size, const char* event_name)
+int trace_callee(const char* found_pattern_ptr, uint32_t prolog_copy_size, const char* event_name)
 {
 
     static char trampoline_string_emit_begin[] =
@@ -327,7 +330,65 @@ int trace_entry(const char* found_pattern_ptr, uint32_t prolog_copy_size, const 
     return 0;
 }
 
-int trace_patterns(const char* pattern_to_find, uint64_t pattern_length, uint32_t pattern_aux_offset, const char* event_name, PATCH_MODE mode)
+int trace_begin_end(const char* found_pattern_ptr, uint32_t pattern_call_offset, uint32_t prolog_copy_size, const char* event_name, bool is_begin)
+{
+    static char trampoline_string[] =
+        "\x50"                                      // push        rax  
+        "\x51"                                      // push        rcx  
+        "\x52"                                      // push        rdx  
+        "\x41\x50"                                  // push        r8  
+        "\x41\x51"                                  // push        r9  
+        "\x41\x52"                                  // push        r10  
+        "\x41\x53"                                  // push        r11  
+        "\x48\xB9\x00\x00\x00\x00\x00\x00\x00\x00"  // mov         rcx, <64bit patch> 
+        "\x48\xBA\x00\x00\x00\x00\x00\x00\x00\x00"  // mov         rdx, <64bit patch>
+        "\xFF\xD2"                                  // call        rdx  
+        "\x41\x5B"                                  // pop         r11  
+        "\x41\x5A"                                  // pop         r10  
+        "\x41\x59"                                  // pop         r9  
+        "\x41\x58"                                  // pop         r8  
+        "\x5A"                                      // pop         rdx  
+        "\x59"                                      // pop         rcx  
+        "\x58";                                     // pop         rax  
+
+    static char trampoline_string_call_original_target[] =
+        "\xE9\x00\x00\x00\x00";                     // jmp         <32bit patch>
+
+    DWORD oldProtection;
+    VirtualProtect((void*)(found_pattern_ptr + pattern_call_offset), 1, PAGE_EXECUTE_READWRITE, &oldProtection);
+
+    char* new_trampoline = get_allocation_near_preferred((void*)(found_pattern_ptr + pattern_call_offset), sizeof(trampoline_string));
+    if (new_trampoline == nullptr)
+    {
+        OutputDebugStringA("Failed to allocate memory for trampoline.");// Error: %d\n", GetLastError());
+        return 1;
+    }
+
+    char* jump_to_original_offset = new_trampoline + sizeof(trampoline_string) - 1 + prolog_copy_size;
+
+    memcpy(new_trampoline, trampoline_string, sizeof(trampoline_string));
+    memcpy(new_trampoline + sizeof(trampoline_string) - 1, found_pattern_ptr + pattern_call_offset, prolog_copy_size);
+    memcpy(jump_to_original_offset, trampoline_string_call_original_target, sizeof(trampoline_string_call_original_target));
+
+    *(uint64_t*)(new_trampoline + 13) = (uint64_t) event_name;
+    *(uint64_t*)(new_trampoline + 23) = (uint64_t) ((is_begin) ? LOP::emit_begin_event : LOP::emit_end_event);
+
+    *(int32_t*)(jump_to_original_offset + 1) = (int32_t) (found_pattern_ptr + pattern_call_offset + prolog_copy_size - jump_to_original_offset - 5);
+
+    // This is final call address switch. We need to do that in one instruction.
+    uint64_t overwrite_value = 
+        0x00000000000000E9
+        | ((uint64_t)(new_trampoline - found_pattern_ptr - pattern_call_offset - 5) << 8) & 0x000000FFFFFFFF00
+        | (*(uint64_t*)(found_pattern_ptr + pattern_call_offset + 5) << 40)               & 0x0000FF0000000000
+        | (*(uint64_t*)(found_pattern_ptr + pattern_call_offset + 6) << 48)               & 0x00FF000000000000
+        | (*(uint64_t*)(found_pattern_ptr + pattern_call_offset + 7) << 56)               & 0xFF00000000000000;
+
+    *(uint64_t*)(found_pattern_ptr + pattern_call_offset) = overwrite_value;
+
+    return 0;
+}
+
+int trace_patterns(const char* pattern_to_find, uint64_t pattern_length, uint32_t pattern_aux_offset1, uint32_t pattern_aux_offset2, const char* event_name, PATCH_MODE mode)
 {
     const char* found_pattern_ptr = nullptr;
 
@@ -373,11 +434,17 @@ int trace_patterns(const char* pattern_to_find, uint64_t pattern_length, uint32_
                 uint64_t ret = 0;
                 switch (mode)
                 {
-                case PATCH_MODE_PATTERN_RELATIVE_CALLSITE:
-                    ret = trace_relative_call(found_pattern_ptr, pattern_aux_offset, event_name_str_dyn->c_str());
+                case PATCH_MODE_PATTERN_CALLER:
+                    ret = trace_caller(found_pattern_ptr, pattern_aux_offset1, event_name_str_dyn->c_str());
                     break;
-                case PATCH_MODE_PATTERN_ENTRY:
-                    ret = trace_entry(found_pattern_ptr, pattern_aux_offset, event_name_str_dyn->c_str());
+                case PATCH_MODE_PATTERN_CALLEE_ENTRY:
+                    ret = trace_callee(found_pattern_ptr, pattern_aux_offset1, event_name_str_dyn->c_str());
+                    break;
+                case PATCH_MODE_PATTERN_BEGIN:
+                    ret = trace_begin_end(found_pattern_ptr, pattern_aux_offset1, pattern_aux_offset2, event_name_str_dyn->c_str(), true);
+                    break;
+                case PATCH_MODE_PATTERN_END:
+                    ret = trace_begin_end(found_pattern_ptr, pattern_aux_offset1, pattern_aux_offset2, event_name_str_dyn->c_str(), false);
                     break;
                 }
 
@@ -428,12 +495,12 @@ void tracer_init(std::string command_file)
     char line[1024];
     while (fgets(line, sizeof(line), file)) {
         char pattern[64];
-        uint64_t length;
-        uint32_t offset;
+        uint32_t offset1;
+        uint32_t offset2;
         PATCH_MODE mode;
         char event_name[64];
         // Parse the line
-        if (sscanf(line, "%u %s %u %s", &mode, pattern, &offset, event_name) == 4) {
+        if (sscanf(line, "%u %s %u %u %s", &mode, pattern, &offset1, &offset2, event_name) == 5) {
             uint64_t length = strlen(pattern);
             if (mode >= NUM_PATCH_MODES) {
                 OutputDebugStringA("Unknown patch mode for event:\n");
@@ -445,8 +512,10 @@ void tracer_init(std::string command_file)
 
             switch (mode)
             {
-            case PATCH_MODE_PATTERN_RELATIVE_CALLSITE:
-            case PATCH_MODE_PATTERN_ENTRY:
+            case PATCH_MODE_PATTERN_CALLER:
+            case PATCH_MODE_PATTERN_CALLEE_ENTRY:
+            case PATCH_MODE_PATTERN_BEGIN:
+            case PATCH_MODE_PATTERN_END:
                 {
                     // Convert hex string to binary.
                     char binary_pattern[64];
@@ -454,11 +523,11 @@ void tracer_init(std::string command_file)
                     for (size_t i = 0; i < length; i += 2) {
                         sscanf(pattern + i, "%2hhx", &binary_pattern[binary_length++]);
                     }
-                    trace_patterns(binary_pattern, binary_length, offset, event_name_dyn->c_str(), mode);
+                    trace_patterns(binary_pattern, binary_length, offset1, offset2, event_name_dyn->c_str(), mode);
                 }
                 break;
             case PATCH_MODE_SYMBOL_ENTRY:
-                trace_symbols(pattern, length, offset, event_name_dyn->c_str());
+                trace_symbols(pattern, length, offset1, event_name_dyn->c_str());
                 break;
             }
         }
