@@ -80,7 +80,7 @@ Profiler stopped and data flushed.
 10. Now, open the process working directory you got from the first dbgview64 log.
 11. You should see json trace file there, name will be something like `events_pid32956_ts5523815.json`
 12. Load the trace into https://ui.perfetto.dev/
-13. We can clearly see the process call this function a lot.
+13. We can clearly see the process call these functions a lot.
 ![alt text](img/trace.jpg)
 
 
