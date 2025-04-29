@@ -1,0 +1,4 @@
+[submodule "low-overhead-profiler"]
+	path = low-overhead-profiler
+	url = git@github.com:k-badz/low-overhead-profiler.git
+	branch = custom-asm-callbacks
